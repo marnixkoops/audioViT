@@ -78,6 +78,7 @@ class cfg:
 
     lr_max = 1e-4
     weight_decay = 1e-6
+    label_smoothing = 0.1
 
     timestamp = datetime.now().replace(microsecond=0)
     run_tag = f"{timestamp}_{backbone}_{experiment_name}_val_{val_ratio}_lr_{lr_max}_decay_{weight_decay}"
@@ -229,8 +230,8 @@ class BirdDataset(Dataset):
         waveform = torch.tensor(waveform, dtype=torch.float32).squeeze()
         melspec = self.db_transform(self.mel_transform(waveform)).type(torch.uint8)
 
-        # melspec = melspec - melspec.min()
-        # melspec = (melspec / melspec.max() * 255).type(torch.uint8)
+        melspec = melspec - melspec.min()
+        melspec = melspec / melspec.max() * 255
 
         return melspec, label
 
@@ -312,7 +313,9 @@ if __name__ == "__main__":
                 [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
             )
 
-            self.loss_function = nn.CrossEntropyLoss(label_smoothing=0.1)
+            self.loss_function = nn.CrossEntropyLoss(
+                label_smoothing=cfg.label_smoothing
+            )
             self.acc = torchmetrics.Accuracy(
                 task="multiclass", num_classes=cfg.n_classes
             )
