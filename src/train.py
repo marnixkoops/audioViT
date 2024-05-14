@@ -5,6 +5,7 @@ import warnings
 from datetime import datetime
 from pprint import pformat
 
+import audiomentations as A
 import librosa
 import lightning as L
 import numpy as np
@@ -34,6 +35,8 @@ sns.set(
 )
 sns.set_style("darkgrid", {"axes.grid": False})
 sns.set_context("paper", font_scale=0.6)
+
+torch.set_float32_matmul_precision("high")
 warnings.simplefilter("ignore")
 
 
@@ -42,8 +45,8 @@ class cfg:
     data_path = "../data"
 
     debug_run = True  # run on 250 rows for debugging
-    experiment_run = False  # run on a stratified 50% data sample for experimentation
-    competition_run = False  # train on 100% of data
+    experiment_run = False  # run on a stratified 80% data sample for experimentation
+    competition_run = False  # run on all data
 
     normalize_waveform = True
     sample_rate = 32000
@@ -68,20 +71,21 @@ class cfg:
     # vit_m1 = "efficientvit_m1.r224_in1k"
     backbone = vit_b0
 
+    num_classes = 182
     add_secondary_labels = True
 
     accelerator = "gpu"
     precision = "16-mixed"
-    n_workers = multiprocessing.cpu_count() - 2
+    n_workers = multiprocessing.cpu_count() - 4
 
     n_epochs = 25
-    batch_size = 128
-    val_ratio = 0.33
+    batch_size = 64
+    val_ratio = 0.25
 
-    lr_min = 1e-6
+    lr_min = 1e-7
     lr_max = 1e-4
     weight_decay = 1e-6
-    label_smoothing = 0.1
+    label_smoothing = 0.0
     fused_adamw = True
 
     timestamp = datetime.now().replace(microsecond=0)
@@ -90,9 +94,10 @@ class cfg:
     if debug_run:
         run_tag = f"{timestamp}_{backbone}_debug"
         accelerator = "cpu"
-        n_epochs = 5
+        n_epochs = 10
         batch_size = 16
         fused_adamw = False
+        num_classes = 10
 
 
 def define_logger():
@@ -109,6 +114,7 @@ def define_logger():
         level=logging.INFO,
         format=" %(asctime)s [%(threadName)s] 🐦‍🔥 %(message)s",
         handlers=handlers,
+        force=True,  # reconfigure root logger, in case of rerunning -> ensures new file
     )
 
     return logger
@@ -128,6 +134,7 @@ def get_config(cfg) -> None:
 def load_metadata(data_path: str) -> pd.DataFrame:
     logger.info(f"Loading prepared dataframes from {data_path}")
     model_input_df = pd.read_csv(f"{data_path}/model_input_df.csv")
+    sample_submission = pd.read_csv(f"{data_path}/sample_submission.csv")
 
     if cfg.debug_run:
         logger.info("Running debug: sampling data to 10 species and 250 samples")
@@ -135,21 +142,19 @@ def load_metadata(data_path: str) -> pd.DataFrame:
         model_input_df = model_input_df[
             model_input_df["primary_label"].isin(top_10_labels)
         ]
-        model_input_df = model_input_df.sample(250).reset_index(drop=True)
+        model_input_df = model_input_df.sample(100).reset_index(drop=True)
 
     if cfg.experiment_run:
-        logger.info("Running experiment: stratified sampling 50% of data")
+        logger.info("Running experiment: stratified sampling 80% of data")
         model_input_df, _ = train_test_split(
             model_input_df,
-            test_size=0.5,
+            test_size=0.20,
             stratify=model_input_df["primary_label"],
             shuffle=True,
             random_state=None,
         )
 
     logger.info(f"Dataframe shape: {model_input_df.shape}")
-
-    sample_submission = pd.read_csv(f"{data_path}/sample_submission.csv")
 
     return model_input_df, sample_submission
 
@@ -207,18 +212,43 @@ def pad_or_crop_waveforms(waveforms: list) -> list:
     return waveforms
 
 
-def mixup_waveforms(x: torch.tensor, y: torch.tensor, alpha: float = 2.0) -> tuple:
-    batch_size = x.size()[0]
-    index = torch.randperm(batch_size)
+def define_train_augmentations(augment: bool = cfg.augment) -> A.Compose:
+    if augment:
+        train_augmentations = A.Compose(
+            [
+                A.LowPassFilter(
+                    min_cutoff_freq=150.0,
+                    max_cutoff_freq=7500.0,
+                    min_rolloff=12.0,
+                    max_rolloff=24.0,
+                    zero_phase=False,
+                    p=0.5,
+                ),
+                A.Gain(min_gain_db=-12, max_gain_db=12, p=0.5),
+                A.AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.05, p=0.5),
+                # A.SevenBandParametricEQ(min_gain_db=-12.0, max_gain_db=12.0, p=0.5),
+                # A.AirAbsorption(
+                #     min_distance=10.0,
+                #     max_distance=100.0,
+                #     p=0.25,
+                # ),
+                # A.PitchShift(min_semitones=-5.0, max_semitones=5.0, p=0.5),
+                # A.BandPassFilter(min_center_freq=100.0, max_center_freq=6000, p=1.0),
+                # A.TimeMask(
+                #     min_band_part=0.1,
+                #     max_band_part=0.15,
+                #     fade=True,
+                #     p=0.5,
+                # ),
+                # A.BitCrush(min_bit_depth=5, max_bit_depth=14, p=0.25)
+            ]
+        )
+    else:
+        train_augmentations = None
 
-    _lambda = np.random.beta(alpha, alpha)
-    if _lambda < 0.5:
-        _lambda = 1 - _lambda
+    logger.info(f"Augmentations: \n{pformat(train_augmentations.transforms)}")
 
-    mixed_x = _lambda * x + (1 - _lambda) * x[index, :]
-    mixed_y = y * _lambda + y[index] * (1 - _lambda)
-
-    return mixed_x, mixed_y
+    return train_augmentations
 
 
 class BirdDataset(Dataset):
@@ -227,6 +257,7 @@ class BirdDataset(Dataset):
         df: pd.DataFrame,
         waveforms: list,
         add_secondary_labels: bool = cfg.add_secondary_labels,
+        augmentations: list = None,
     ):
 
         self.df = df
@@ -234,6 +265,8 @@ class BirdDataset(Dataset):
         self.num_classes = cfg.num_classes
         self.class_to_label_map = class_to_label_map
         self.add_secondary_labels = add_secondary_labels
+
+        self.augmentations = augmentations
 
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=cfg.sample_rate,
@@ -256,14 +289,14 @@ class BirdDataset(Dataset):
         self,
         primary_label: str,
         secondary_labels: list,
-        secondary_label_weight: float = 1.0,
+        secondary_label_weight: float = 1,
     ) -> torch.tensor:
-        target = torch.zeros(self.num_classes, dtype=torch.float32)
-        primary_target = torch.tensor([0], dtype=torch.int64)
+        target = torch.zeros(self.num_classes, dtype=torch.int64)
+        # primary_target = torch.tensor([0], dtype=torch.int64)
 
         if primary_label != "nocall":
             primary_label = self.class_to_label_map[primary_label]
-            target[primary_label] = 1.0
+            target[primary_label] = 1
             primary_target = torch.tensor(primary_label, dtype=torch.int64)
 
             if self.add_secondary_labels:
@@ -281,19 +314,20 @@ class BirdDataset(Dataset):
         waveform = self.waveforms[idx]
         primary_label = self.df.iloc[idx]["primary_label"]
         secondary_labels = self.df.iloc[idx]["secondary_labels"]
+        augmentations = self.augmentations
+
+        if augmentations is not None:
+            waveform = augmentations(waveform, sample_rate=cfg.sample_rate)
 
         waveform = torch.tensor(waveform, dtype=torch.float32).squeeze()
-        melspec = self.db_transform(self.mel_transform(waveform)).type(torch.uint8)
 
+        melspec = self.db_transform(self.mel_transform(waveform)).type(torch.uint8)
         melspec = melspec - melspec.min()
         melspec = melspec / melspec.max() * 255
 
         target, primary_target = self.create_target(
             primary_label=primary_label, secondary_labels=secondary_labels
         )
-
-        # print(f"target: {target}")
-        # print(f"target_int: {target_int}")
 
         return melspec, target, primary_target
 
@@ -308,9 +342,16 @@ if __name__ == "__main__":
     waveforms = read_waveforms_parallel(model_input_df=model_input_df)
     waveforms = pad_or_crop_waveforms(waveforms=waveforms)
 
+    # grouped split on sample index to keep different windows from the same sample
+    # together if splitting randomly this can be considered as a form of leakage
+    # validating on a windowed waveform while windows of the same waveform were used for
+    # training is easier than classifying a waveform from a different sample, which is
+    # the case in practice
+
     logger.info(f"Splitting {len(waveforms)} waveforms into train/val: {cfg.val_ratio}")
     n_splits = int(round(1 / cfg.val_ratio))
     kfold = StratifiedGroupKFold(n_splits=n_splits, shuffle=True)
+
     for fold_index, (train_index, val_index) in enumerate(
         kfold.split(
             X=model_input_df,
@@ -318,7 +359,7 @@ if __name__ == "__main__":
             groups=model_input_df["sample_index"],
         )
     ):
-        break
+        break  # run a single split for now
 
     train_df = model_input_df.iloc[train_index]
     val_df = model_input_df.iloc[val_index]
@@ -326,16 +367,10 @@ if __name__ == "__main__":
     train_waveforms = [waveforms[i] for i in train_index]
     val_waveforms = [waveforms[i] for i in val_index]
 
-    # train_waveforms, val_waveforms, train_labels, val_labels = train_test_split(
-    #     waveforms,
-    #     labels,
-    #     test_size=cfg.val_ratio,
-    #     stratify=labels,
-    #     shuffle=True,
-    #     random_state=None,
-    # )
-
-    train_dataset = BirdDataset(df=train_df, waveforms=train_waveforms)
+    train_augmentations = define_train_augmentations()
+    train_dataset = BirdDataset(
+        df=train_df, waveforms=train_waveforms, augmentations=train_augmentations
+    )
     val_dataset = BirdDataset(df=val_df, waveforms=val_waveforms)
 
     train_dataloader = DataLoader(
@@ -375,8 +410,24 @@ if __name__ == "__main__":
                 label_smoothing=cfg.label_smoothing
             )
             self.accuracy = torchmetrics.Accuracy(
-                task="multiclass",
-                num_classes=cfg.num_classes,
+                task="multiclass", num_classes=cfg.num_classes
+            )
+            self.f1_macro = torchmetrics.F1Score(
+                task="multilabel",
+                num_labels=cfg.num_classes,
+                average="macro",
+                ignore_index=0,
+            )
+            self.f1_weighted = torchmetrics.F1Score(
+                task="multilabel",
+                num_labels=cfg.num_classes,
+                average="weighted",
+                ignore_index=0,
+            )
+            self.auroc = torchmetrics.AUROC(
+                task="multilabel",
+                num_labels=cfg.num_classes,
+                average="macro",
             )
 
         def forward(self, x):
@@ -390,9 +441,11 @@ if __name__ == "__main__":
         def training_step(self, batch, batch_idx):
             x, y, y_primary = batch
             y_pred = self(x)
-            loss = self.loss_function(y_pred, y)
 
+            loss = self.loss_function(y_pred, y_primary)
             train_acc = self.accuracy(y_pred.softmax(dim=1), y_primary)
+            train_f1_macro = self.f1_macro(y_pred.softmax(dim=1), y)
+            train_auroc = self.auroc(y_pred.softmax(dim=1), y)
 
             self.log(
                 "train_loss",
@@ -403,21 +456,41 @@ if __name__ == "__main__":
                 logger=True,
             )
             self.log(
-                "train_acc@1",
+                "train_acc_1",
                 train_acc,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=True,
                 logger=True,
             )
+            self.log(
+                "train_f1_macro_ignore",
+                train_f1_macro,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
+            self.log(
+                "train_auroc",
+                train_auroc,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
+
             return loss
 
         def validation_step(self, batch, batch_idx):
             x_val, y_val, y_primary_val = batch
             y_pred = self(x_val)
 
-            val_loss = self.loss_function(y_pred, y_val)
+            val_loss = self.loss_function(y_pred, y_primary_val)
             val_acc = self.accuracy(y_pred.softmax(dim=1), y_primary_val)
+            val_f1_weighted = self.f1_weighted(y_pred.softmax(dim=1), y_val)
+            val_f1_macro = self.f1_macro(y_pred.softmax(dim=1), y_val)
+            val_auroc = self.auroc(y_pred.softmax(dim=1), y_val)
 
             self.log(
                 "val_loss",
@@ -428,13 +501,38 @@ if __name__ == "__main__":
                 logger=True,
             )
             self.log(
-                "val_acc@1",
+                "val_acc_1",
                 val_acc,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=True,
                 logger=True,
             )
+            self.log(
+                "val_f1_weighted_ignore",
+                val_f1_weighted,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
+            self.log(
+                "val_f1_macro_ignore",
+                val_f1_macro,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
+            self.log(
+                "val_auroc",
+                val_auroc,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
+
             return val_loss
 
         def on_train_epoch_end(self):
@@ -467,14 +565,17 @@ if __name__ == "__main__":
 
     csv_logger = None
     if not cfg.debug_run:
-        os.environ["PJRT_DEVICE"] = (
-            "GPU"  # fix for cloud GPU, otherwise XLA/autocast argue and all is fucked
-        )
+        os.environ["PJRT_DEVICE"] = "GPU"  # fix for G Cloud to avoid XLA/autocast clash
         csv_logger = L.pytorch.loggers.CSVLogger(save_dir="../logs/")
         csv_logger.log_hyperparams(config_dictionary)
 
+    progress_bar = TQDMProgressBar(process_position=1)
     early_stopping = EarlyStopping(
-        monitor="val_acc", min_delta=0.001, patience=5, verbose=False, mode="max"
+        monitor="val_loss",
+        min_delta=0.001,
+        patience=cfg.patience,
+        verbose=True,
+        mode="min",
     )
 
     model = EfficientViT()
@@ -484,7 +585,7 @@ if __name__ == "__main__":
         max_epochs=cfg.n_epochs,
         accelerator=cfg.accelerator,
         precision=cfg.precision,
-        callbacks=[TQDMProgressBar(process_position=1), early_stopping],
+        callbacks=[progress_bar, early_stopping],
         logger=csv_logger,
         log_every_n_steps=10,
     )
@@ -498,7 +599,7 @@ if __name__ == "__main__":
     logger.info("Finished training")
     if not cfg.debug_run:
         logger.info("Saving model")
-        trainer.save_checkpoint(
-            f"model_objects/{cfg.run_tag}_epochs_{trainer.current_epoch}.ckpt"
-        )
+        filename = f"{cfg.run_tag}_epochs_{trainer.current_epoch}.ckpt"
+        trainer.save_checkpoint(f"../model_objects/{filename}")
+        logger.info(f"Saved model to filename: {filename}")
     logger.info("All done")
