@@ -3,3 +3,5 @@ data/*
 model_objects/*
 logs/*
 */lightning_logs/*
+*old.py
+*backup.py
