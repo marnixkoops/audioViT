@@ -227,7 +227,7 @@ if __name__ == "__main__":
             self,
             alpha: float = 0.25,
             gamma: float = 2,
-            reduction: str = "none",  # or "mean"
+            reduction: str = "mean",
             bce_weight: float = 1.0,
             focal_weight: float = 1.0,
         ):
@@ -264,10 +264,10 @@ if __name__ == "__main__":
                 num_classes=cfg.n_classes,
             )
 
-            self.loss_criterion = nn.CrossEntropyLoss()
+            # self.loss_criterion = nn.CrossEntropyLoss()
             # self.loss_criterion = nn.BCEWithLogitsLoss(reduction="none")
             # self.loss_criterion = FocalLoss()
-            self.loss_criterion = FocalLossBCE(reduction="none")
+            self.loss_criterion = FocalLossBCE(reduction="mean")
 
             self.acc = torchmetrics.Accuracy(
                 task="multiclass", num_classes=cfg.n_classes

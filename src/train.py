@@ -1,11 +1,9 @@
 import logging
-import multiprocessing
 import os
 import warnings
 from datetime import datetime
 from pprint import pformat
 
-import audiomentations as A
 import librosa
 import lightning as L
 import numpy as np
@@ -15,13 +13,11 @@ import timm
 import torch
 import torchaudio
 import torchmetrics
+import torchvision
 from joblib import Parallel, delayed
 from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
-from matplotlib import pyplot as plt
-from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import StratifiedGroupKFold, train_test_split
-from torch import nn
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
@@ -41,12 +37,12 @@ warnings.simplefilter("ignore")
 
 
 class cfg:
-    experiment_name = "baseline"
+    experiment_name = "augment"
     data_path = "../data"
 
-    debug_run = True  # run on 250 rows for debugging
-    experiment_run = False  # run on a stratified 80% data sample for experimentation
-    competition_run = False  # run on all data
+    debug_run = True  # run on 250 rows
+    experiment_run = False  # run on a stratified 50% data sample
+    competition_run = False  # run on full data
 
     normalize_waveform = True
     sample_rate = 32000
@@ -73,31 +69,32 @@ class cfg:
 
     num_classes = 182
     add_secondary_labels = True
+    label_smoothing = 0.0
 
     accelerator = "gpu"
     precision = "16-mixed"
-    n_workers = multiprocessing.cpu_count() - 4
+    n_workers = os.cpu_count() - 4
 
     n_epochs = 25
-    batch_size = 64
+    batch_size = 128
     val_ratio = 0.25
 
     lr_min = 1e-7
     lr_max = 1e-4
     weight_decay = 1e-6
-    label_smoothing = 0.0
     fused_adamw = True
+    patience = 10
 
     timestamp = datetime.now().replace(microsecond=0)
     run_tag = f"{timestamp}_{backbone}_{experiment_name}_val_{val_ratio}_lr_{lr_max}_decay_{weight_decay}"
 
     if debug_run:
         run_tag = f"{timestamp}_{backbone}_debug"
+        lr_max = 1e-2
         accelerator = "cpu"
         n_epochs = 10
-        batch_size = 16
+        batch_size = 32
         fused_adamw = False
-        num_classes = 10
 
 
 def define_logger():
@@ -138,17 +135,17 @@ def load_metadata(data_path: str) -> pd.DataFrame:
 
     if cfg.debug_run:
         logger.info("Running debug: sampling data to 10 species and 250 samples")
-        top_10_labels = model_input_df["primary_label"].value_counts()[0:10].index
+        top_10_labels = model_input_df["primary_label"].value_counts()[0:25].index
         model_input_df = model_input_df[
             model_input_df["primary_label"].isin(top_10_labels)
         ]
-        model_input_df = model_input_df.sample(100).reset_index(drop=True)
+        model_input_df = model_input_df.sample(1000).reset_index(drop=True)
 
     if cfg.experiment_run:
-        logger.info("Running experiment: stratified sampling 80% of data")
+        logger.info("Running experiment: stratified sampling 50% of data")
         model_input_df, _ = train_test_split(
             model_input_df,
-            test_size=0.20,
+            test_size=0.50,
             stratify=model_input_df["primary_label"],
             shuffle=True,
             random_state=None,
@@ -167,7 +164,7 @@ def read_waveform(filename: str) -> np.ndarray:
 
 def read_waveforms_parallel(model_input_df: pd.DataFrame):
     logger.info("Parallel Loading waveforms")
-    waveforms = Parallel(n_jobs=cfg.n_workers)(
+    waveforms = Parallel(n_jobs=cfg.n_workers, prefer="threads")(
         delayed(read_waveform)(filename)
         for filename in tqdm(model_input_df["window_filename"], desc="Loading waves")
     )
@@ -179,7 +176,6 @@ def create_label_map(submission_df: pd.DataFrame) -> dict:
     logging.info("Creating label mappings")
     cfg.labels = submission_df.columns[1:]
     cfg.num_classes = len(cfg.labels)
-
     class_to_label_map = dict(zip(cfg.labels, np.arange(cfg.num_classes)))
 
     return class_to_label_map
@@ -212,61 +208,19 @@ def pad_or_crop_waveforms(waveforms: list) -> list:
     return waveforms
 
 
-def define_train_augmentations(augment: bool = cfg.augment) -> A.Compose:
-    if augment:
-        train_augmentations = A.Compose(
-            [
-                A.LowPassFilter(
-                    min_cutoff_freq=150.0,
-                    max_cutoff_freq=7500.0,
-                    min_rolloff=12.0,
-                    max_rolloff=24.0,
-                    zero_phase=False,
-                    p=0.5,
-                ),
-                A.Gain(min_gain_db=-12, max_gain_db=12, p=0.5),
-                A.AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.05, p=0.5),
-                # A.SevenBandParametricEQ(min_gain_db=-12.0, max_gain_db=12.0, p=0.5),
-                # A.AirAbsorption(
-                #     min_distance=10.0,
-                #     max_distance=100.0,
-                #     p=0.25,
-                # ),
-                # A.PitchShift(min_semitones=-5.0, max_semitones=5.0, p=0.5),
-                # A.BandPassFilter(min_center_freq=100.0, max_center_freq=6000, p=1.0),
-                # A.TimeMask(
-                #     min_band_part=0.1,
-                #     max_band_part=0.15,
-                #     fade=True,
-                #     p=0.5,
-                # ),
-                # A.BitCrush(min_bit_depth=5, max_bit_depth=14, p=0.25)
-            ]
-        )
-    else:
-        train_augmentations = None
-
-    logger.info(f"Augmentations: \n{pformat(train_augmentations.transforms)}")
-
-    return train_augmentations
-
-
 class BirdDataset(Dataset):
     def __init__(
         self,
         df: pd.DataFrame,
         waveforms: list,
         add_secondary_labels: bool = cfg.add_secondary_labels,
-        augmentations: list = None,
+        melspec_augmentations: list = None,
     ):
-
         self.df = df
         self.waveforms = waveforms
         self.num_classes = cfg.num_classes
         self.class_to_label_map = class_to_label_map
         self.add_secondary_labels = add_secondary_labels
-
-        self.augmentations = augmentations
 
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=cfg.sample_rate,
@@ -291,8 +245,8 @@ class BirdDataset(Dataset):
         secondary_labels: list,
         secondary_label_weight: float = 1,
     ) -> torch.tensor:
-        target = torch.zeros(self.num_classes, dtype=torch.int64)
-        # primary_target = torch.tensor([0], dtype=torch.int64)
+        target = torch.zeros(self.num_classes, dtype=torch.float32)
+        # primary_target = torch.tensor(0, dtype=torch.int64)
 
         if primary_label != "nocall":
             primary_label = self.class_to_label_map[primary_label]
@@ -305,7 +259,9 @@ class BirdDataset(Dataset):
                     if label != "" and label in self.class_to_label_map.keys():
                         target[self.class_to_label_map[label]] = secondary_label_weight
 
-        return target, primary_target
+        binary_target = target.to(torch.int64)
+
+        return target, binary_target, primary_target
 
     def __len__(self):
         return len(self.waveforms)
@@ -314,22 +270,22 @@ class BirdDataset(Dataset):
         waveform = self.waveforms[idx]
         primary_label = self.df.iloc[idx]["primary_label"]
         secondary_labels = self.df.iloc[idx]["secondary_labels"]
-        augmentations = self.augmentations
 
-        if augmentations is not None:
-            waveform = augmentations(waveform, sample_rate=cfg.sample_rate)
+        # if waveform_augmentations:
+        #     waveform = waveform_augmentations(waveform, sample_rate=cfg.sample_rate)
 
         waveform = torch.tensor(waveform, dtype=torch.float32).squeeze()
 
         melspec = self.db_transform(self.mel_transform(waveform)).type(torch.uint8)
+
         melspec = melspec - melspec.min()
         melspec = melspec / melspec.max() * 255
 
-        target, primary_target = self.create_target(
+        target, binary_target, primary_target = self.create_target(
             primary_label=primary_label, secondary_labels=secondary_labels
         )
 
-        return melspec, target, primary_target
+        return melspec, target, binary_target, primary_target
 
 
 if __name__ == "__main__":
@@ -367,10 +323,7 @@ if __name__ == "__main__":
     train_waveforms = [waveforms[i] for i in train_index]
     val_waveforms = [waveforms[i] for i in val_index]
 
-    train_augmentations = define_train_augmentations()
-    train_dataset = BirdDataset(
-        df=train_df, waveforms=train_waveforms, augmentations=train_augmentations
-    )
+    train_dataset = BirdDataset(df=train_df, waveforms=train_waveforms)
     val_dataset = BirdDataset(df=val_df, waveforms=val_waveforms)
 
     train_dataloader = DataLoader(
@@ -392,6 +345,89 @@ if __name__ == "__main__":
         pin_memory=True,
     )
 
+    # ###############
+    # from IPython.display import Audio
+
+    # mel_transform = torchaudio.transforms.MelSpectrogram(
+    #     sample_rate=cfg.sample_rate,
+    #     n_mels=cfg.melspec_hres,
+    #     f_min=cfg.freq_min,
+    #     f_max=cfg.freq_max,
+    #     n_fft=cfg.n_fft,
+    #     hop_length=cfg.hop_length,
+    #     normalized=cfg.normalize_waveform,
+    #     center=True,
+    #     pad_mode="reflect",
+    #     norm="slaney",
+    #     mel_scale="slaney",
+    # )
+    # db_transform = torchaudio.transforms.AmplitudeToDB(
+    #     stype="power", top_db=cfg.max_decibels
+    # )
+
+    # idx = np.random.randint(low=0, high=len(train_waveforms))
+    # melspec = db_transform(mel_transform(torch.tensor(train_waveforms[idx])))
+    # plt.imshow(melspec)
+    # Audio(train_waveforms[idx], rate=cfg.sample_rate)
+
+    # augmented_waveform = train_augmentations(
+    #     train_waveforms[idx], sample_rate=cfg.sample_rate
+    # )
+    # aug_melspec = db_transform(mel_transform(torch.tensor(augmented_waveform)))
+    # plt.imshow(aug_melspec)
+    # Audio(augmented_waveform, rate=cfg.sample_rate)
+
+    class FocalLoss(torch.nn.Module):
+        def __init__(
+            self,
+            alpha: float = 0.25,
+            gamma: float = 2,
+            reduction: str = "mean",
+        ):
+            super().__init__()
+            self.alpha = alpha
+            self.gamma = gamma
+            self.reduction = reduction
+
+        def forward(self, x, y):
+            loss = torchvision.ops.focal_loss.sigmoid_focal_loss(
+                inputs=x,
+                targets=y,
+                alpha=self.alpha,
+                gamma=self.gamma,
+                reduction=self.reduction,
+            )
+            return loss
+
+    class FocalLossBCE(torch.nn.Module):
+        def __init__(
+            self,
+            alpha: float = 0.25,
+            gamma: float = 2,
+            reduction: str = "mean",
+            bce_weight: float = 1.0,
+            focal_weight: float = 1.0,
+        ):
+            super().__init__()
+            self.alpha = alpha
+            self.gamma = gamma
+            self.reduction = reduction
+            self.bce = torch.nn.BCEWithLogitsLoss(reduction=reduction)
+            self.bce_weight = bce_weight
+            self.focal_weight = focal_weight
+
+        def forward(self, inputs, targets):
+            focall_loss = torchvision.ops.focal_loss.sigmoid_focal_loss(
+                inputs=inputs,
+                targets=targets,
+                alpha=self.alpha,
+                gamma=self.gamma,
+                reduction=self.reduction,
+            )
+            bce_loss = self.bce(inputs, targets)
+            combined_loss = self.bce_weight * bce_loss + self.focal_weight * focall_loss
+            return combined_loss
+
     class EfficientViT(L.LightningModule):
         def __init__(self):
             super().__init__()
@@ -406,11 +442,17 @@ if __name__ == "__main__":
                 [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
             )
 
-            self.loss_function = nn.CrossEntropyLoss(
-                label_smoothing=cfg.label_smoothing
+            self.loss_function = FocalLoss()
+            self.loss_function = FocalLossBCE()
+            # self.loss_function = nn.CrossEntropyLoss(
+            #     label_smoothing=cfg.label_smoothing
+            # )
+
+            self.accuracy_top1 = torchmetrics.Accuracy(
+                task="multiclass", num_classes=cfg.num_classes, top_k=1
             )
-            self.accuracy = torchmetrics.Accuracy(
-                task="multiclass", num_classes=cfg.num_classes
+            self.accuracy_top2 = torchmetrics.Accuracy(
+                task="multiclass", num_classes=cfg.num_classes, top_k=2
             )
             self.f1_macro = torchmetrics.F1Score(
                 task="multilabel",
@@ -429,6 +471,9 @@ if __name__ == "__main__":
                 num_labels=cfg.num_classes,
                 average="macro",
             )
+            self.lrap = torchmetrics.classification.MultilabelRankingAveragePrecision(
+                num_labels=cfg.num_classes
+            )
 
         def forward(self, x):
             x = x.unsqueeze(1).expand(-1, 3, -1, -1)  # go from HxW → 3xHxW
@@ -439,13 +484,14 @@ if __name__ == "__main__":
             return out
 
         def training_step(self, batch, batch_idx):
-            x, y, y_primary = batch
+            x, y, y_binary, y_primary = batch
             y_pred = self(x)
+            loss = self.loss_function(y_pred, y)
 
-            loss = self.loss_function(y_pred, y_primary)
-            train_acc = self.accuracy(y_pred.softmax(dim=1), y_primary)
-            train_f1_macro = self.f1_macro(y_pred.softmax(dim=1), y)
-            train_auroc = self.auroc(y_pred.softmax(dim=1), y)
+            train_accuracy_top1 = self.accuracy_top1(y_pred, y_primary)
+            train_accuracy_top2 = self.accuracy_top2(y_pred, y_primary)
+            train_f1_macro = self.f1_macro(y_pred, y_binary)
+            train_lrap = self.lrap(y_pred, y_binary)
 
             self.log(
                 "train_loss",
@@ -457,7 +503,15 @@ if __name__ == "__main__":
             )
             self.log(
                 "train_acc_1",
-                train_acc,
+                train_accuracy_top1,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
+            self.log(
+                "train_acc_2",
+                train_accuracy_top2,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=True,
@@ -472,8 +526,8 @@ if __name__ == "__main__":
                 logger=True,
             )
             self.log(
-                "train_auroc",
-                train_auroc,
+                "train_lrap",
+                train_lrap,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=True,
@@ -483,14 +537,16 @@ if __name__ == "__main__":
             return loss
 
         def validation_step(self, batch, batch_idx):
-            x_val, y_val, y_primary_val = batch
+            x_val, y_val, y_binary_val, y_primary_val = batch
             y_pred = self(x_val)
+            val_loss = self.loss_function(y_pred, y_val)
 
-            val_loss = self.loss_function(y_pred, y_primary_val)
-            val_acc = self.accuracy(y_pred.softmax(dim=1), y_primary_val)
-            val_f1_weighted = self.f1_weighted(y_pred.softmax(dim=1), y_val)
-            val_f1_macro = self.f1_macro(y_pred.softmax(dim=1), y_val)
-            val_auroc = self.auroc(y_pred.softmax(dim=1), y_val)
+            val_accuracy_top1 = self.accuracy_top1(y_pred, y_primary_val)
+            val_accuracy_top2 = self.accuracy_top2(y_pred, y_primary_val)
+            val_f1_weighted = self.f1_weighted(y_pred, y_binary_val)
+            val_f1_macro = self.f1_macro(y_pred, y_binary_val)
+            val_auroc = self.auroc(y_pred, y_binary_val)
+            val_lrap = self.lrap(y_pred, y_binary_val)
 
             self.log(
                 "val_loss",
@@ -502,7 +558,15 @@ if __name__ == "__main__":
             )
             self.log(
                 "val_acc_1",
-                val_acc,
+                val_accuracy_top1,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
+            self.log(
+                "val_acc_2",
+                val_accuracy_top2,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=True,
@@ -527,6 +591,14 @@ if __name__ == "__main__":
             self.log(
                 "val_auroc",
                 val_auroc,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
+            self.log(
+                "val_lrap",
+                val_lrap,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=True,
