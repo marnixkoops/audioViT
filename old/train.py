@@ -1,16 +1,19 @@
 import logging
 import os
+import random
 import warnings
 from datetime import datetime
 from pprint import pformat
 
 import librosa
 import lightning as L
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import timm
 import torch
+import torch_audiomentations as audiomentations
 import torchaudio
 import torchmetrics
 import torchvision
@@ -37,12 +40,12 @@ warnings.simplefilter("ignore")
 
 
 class cfg:
-    experiment_name = "augment"
+    experiment_name = "mixup_sec_labels"
     data_path = "../data"
 
-    debug_run = True  # run on 250 rows
-    experiment_run = False  # run on a stratified 50% data sample
-    competition_run = False  # run on full data
+    debug_run = True  # run on a small sample
+    experiment_run = False  # run on a stratified data sample
+    production_run = False  # run on all data
 
     normalize_waveform = True
     sample_rate = 32000
@@ -51,10 +54,10 @@ class cfg:
     window_length = None
     melspec_hres = 128
     melspec_wres = 312
-    freq_min = 20
-    freq_max = 16000
-    log_scale_power = 2
-    max_decibels = 80
+    freq_min = 40
+    freq_max = 15000
+    log_scale_power = 2.0
+    max_decibels = 100
     frame_duration = 5
     frame_rate = sample_rate / hop_length
 
@@ -70,31 +73,42 @@ class cfg:
     num_classes = 182
     add_secondary_labels = True
     label_smoothing = 0.0
+    weighted_sampling = True
+    sample_weight_factor = 0.25
+    waveform_augmentation = True
+    melspec_mixup_prob = 0.5
+    melspec_mixup = True
+    melspec_supermixup = False
 
     accelerator = "gpu"
     precision = "16-mixed"
     n_workers = os.cpu_count() - 4
 
-    n_epochs = 25
+    n_epochs = 100
     batch_size = 128
-    val_ratio = 0.25
+    val_ratio = 0.20
+    patience = 15
 
     lr_min = 1e-7
     lr_max = 1e-4
     weight_decay = 1e-6
     fused_adamw = True
-    patience = 10
+
+    focal_alpha = 0.25
+    focal_gamma = 2.0
+    focal_weight = 1.0
+    bce_weight = 1.0
 
     timestamp = datetime.now().replace(microsecond=0)
     run_tag = f"{timestamp}_{backbone}_{experiment_name}_val_{val_ratio}_lr_{lr_max}_decay_{weight_decay}"
 
     if debug_run:
         run_tag = f"{timestamp}_{backbone}_debug"
-        lr_max = 1e-2
         accelerator = "cpu"
         n_epochs = 10
         batch_size = 32
         fused_adamw = False
+        num_classes = 10
 
 
 def define_logger():
@@ -135,21 +149,23 @@ def load_metadata(data_path: str) -> pd.DataFrame:
 
     if cfg.debug_run:
         logger.info("Running debug: sampling data to 10 species and 250 samples")
-        top_10_labels = model_input_df["primary_label"].value_counts()[0:25].index
+        top_10_labels = model_input_df["primary_label"].value_counts()[0:10].index
         model_input_df = model_input_df[
             model_input_df["primary_label"].isin(top_10_labels)
         ]
         model_input_df = model_input_df.sample(1000).reset_index(drop=True)
 
-    if cfg.experiment_run:
-        logger.info("Running experiment: stratified sampling 50% of data")
+    elif cfg.experiment_run:
+        logger.info("Running experiment: stratified sampling data")
         model_input_df, _ = train_test_split(
             model_input_df,
-            test_size=0.50,
-            stratify=model_input_df["primary_label"],
+            test_size=0.01,
+            # stratify=model_input_df["primary_label"],
             shuffle=True,
-            random_state=None,
         )
+
+    elif cfg.production_run:
+        model_input_df.sample(frac=1).reset_index(drop=True)
 
     logger.info(f"Dataframe shape: {model_input_df.shape}")
 
@@ -181,21 +197,20 @@ def create_label_map(submission_df: pd.DataFrame) -> dict:
     return class_to_label_map
 
 
-def pad_or_crop_waveforms(waveforms: list) -> list:
+def pad_or_crop_waveforms(waveforms: list, pad_method: str = "repeat") -> list:
     logging.info("Padding or cropping waveforms to desired duration")
     desired_length = cfg.sample_rate * cfg.frame_duration
 
     def _pad_or_crop(waveform: np.ndarray) -> np.ndarray:
         length = len(waveform)
-        if length < desired_length:  # repeat if waveform too small
-            repeat_length = desired_length - length
-            waveform = np.concatenate([waveform, waveform[:repeat_length]])
-            length = len(waveform)
 
-            if length < desired_length:  # repeat if waveform still too small
-                repeat_length = desired_length - length
-                waveform = np.concatenate([waveform, waveform[:repeat_length]])
-                length = len(waveform)
+        while length < desired_length:  # repeat if waveform too small
+            repeat_length = desired_length - length
+            padding_array = waveform[:repeat_length]
+            if pad_method != "repeat":
+                padding_array = np.zeros(shape=waveform[:repeat_length].shape)
+            waveform = np.concatenate([waveform, padding_array])
+            length = len(waveform)
 
         if length > desired_length:  # crop if waveform is too big
             offset = np.random.randint(0, length - desired_length)
@@ -208,19 +223,41 @@ def pad_or_crop_waveforms(waveforms: list) -> list:
     return waveforms
 
 
+def add_sample_weights(
+    model_input_df: pd.DataFrame, weight_factor: float = cfg.sample_weight_factor
+) -> pd.DataFrame:
+    sample_weights = round(
+        (
+            model_input_df["primary_label"].value_counts()
+            / model_input_df["primary_label"].value_counts().sum()
+        )
+        ** (-weight_factor)
+    )
+    sample_weights = pd.DataFrame(
+        {
+            "primary_label": sample_weights.index,
+            "sample_weight": sample_weights.values.astype(int),
+        }
+    )
+    model_input_df = model_input_df.merge(
+        sample_weights, on="primary_label", how="left"
+    )
+    return model_input_df
+
+
 class BirdDataset(Dataset):
     def __init__(
         self,
         df: pd.DataFrame,
         waveforms: list,
         add_secondary_labels: bool = cfg.add_secondary_labels,
-        melspec_augmentations: list = None,
     ):
         self.df = df
         self.waveforms = waveforms
         self.num_classes = cfg.num_classes
         self.class_to_label_map = class_to_label_map
         self.add_secondary_labels = add_secondary_labels
+        self.waveform_augmentation = cfg.waveform_augmentation
 
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=cfg.sample_rate,
@@ -271,13 +308,40 @@ class BirdDataset(Dataset):
         primary_label = self.df.iloc[idx]["primary_label"]
         secondary_labels = self.df.iloc[idx]["secondary_labels"]
 
-        # if waveform_augmentations:
-        #     waveform = waveform_augmentations(waveform, sample_rate=cfg.sample_rate)
+        waveform = torch.tensor(waveform, dtype=torch.float32)
 
-        waveform = torch.tensor(waveform, dtype=torch.float32).squeeze()
+        if self.waveform_augmentation:
+            transform = audiomentations.Compose(
+                [
+                    audiomentations.LowPassFilter(
+                        min_cutoff_freq=4000,
+                        max_cutoff_freq=5000,
+                        p=0.25,
+                        p_mode="per_example",
+                    ),
+                    audiomentations.Gain(
+                        min_gain_in_db=-10,
+                        max_gain_in_db=10,
+                        p=0.25,
+                        p_mode="per_example",
+                    ),
+                    # audiomentations.SpliceOut(
+                    #     num_time_intervals=2,
+                    #     max_width=2000,
+                    #     p=0.25,
+                    #     p_mode="per_example",
+                    # ),
+                    audiomentations.TimeInversion(p=0.20, p_mode="per_example"),
+                    audiomentations.AddColoredNoise(p=0.25, p_mode="per_example"),
+                    # audiomentations.AddBackgroundNoise()
+                ],
+            )
+            waveform = transform(
+                waveform.view(-1, 1, len(waveform)), sample_rate=cfg.sample_rate
+            )
+            waveform = waveform.squeeze()
 
         melspec = self.db_transform(self.mel_transform(waveform)).type(torch.uint8)
-
         melspec = melspec - melspec.min()
         melspec = melspec / melspec.max() * 255
 
@@ -293,6 +357,7 @@ if __name__ == "__main__":
     config_dictionary = get_config(cfg)
 
     model_input_df, sample_submission = load_metadata(data_path=cfg.data_path)
+    model_input_df = add_sample_weights(model_input_df)
     class_to_label_map = create_label_map(submission_df=sample_submission)
 
     waveforms = read_waveforms_parallel(model_input_df=model_input_df)
@@ -303,11 +368,9 @@ if __name__ == "__main__":
     # validating on a windowed waveform while windows of the same waveform were used for
     # training is easier than classifying a waveform from a different sample, which is
     # the case in practice
-
     logger.info(f"Splitting {len(waveforms)} waveforms into train/val: {cfg.val_ratio}")
     n_splits = int(round(1 / cfg.val_ratio))
     kfold = StratifiedGroupKFold(n_splits=n_splits, shuffle=True)
-
     for fold_index, (train_index, val_index) in enumerate(
         kfold.split(
             X=model_input_df,
@@ -335,6 +398,29 @@ if __name__ == "__main__":
         pin_memory=True,
     )
 
+    if cfg.weighted_sampling:
+        logger.info(
+            f"Defining weighted sampling with  factor: {cfg.sample_weight_factor}"
+        )
+        sample_weight = train_df["sample_weight"].values
+        sample_weight = torch.from_numpy(sample_weight)
+
+        weighted_sampler = WeightedRandomSampler(
+            sample_weight.type("torch.DoubleTensor"),
+            len(sample_weight),
+            replacement=True,
+        )
+
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=cfg.batch_size,
+            sampler=weighted_sampler,
+            drop_last=True,
+            num_workers=cfg.n_workers,
+            persistent_workers=True,
+            pin_memory=True,
+        )
+
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=cfg.batch_size,
@@ -344,6 +430,15 @@ if __name__ == "__main__":
         persistent_workers=True,
         pin_memory=True,
     )
+
+    logger.info("Dataloaders ready to go brrr")
+
+    # for batch in train_dataloader:
+    #     batch = batch
+    #     break
+
+    #     x, y, y_binary, y_primary = batch
+    #     x, y = melspec_supermix(x=x, y=y)
 
     # ###############
     # from IPython.display import Audio
@@ -377,11 +472,23 @@ if __name__ == "__main__":
     # plt.imshow(aug_melspec)
     # Audio(augmented_waveform, rate=cfg.sample_rate)
 
+    class GeM(torch.nn.Module):
+        def __init__(self, p=3, eps=1e-6):
+            super(GeM, self).__init__()
+            self.p = torch.nn.Parameter(torch.ones(1) * p)
+            self.eps = eps
+
+        def forward(self, x):
+            out = torch.nn.functional.avg_pool2d(
+                x.clamp(min=self.eps).pow(self.p), (x.size(-2), x.size(-1))
+            ).pow(1.0 / self.p)
+            return out
+
     class FocalLoss(torch.nn.Module):
         def __init__(
             self,
-            alpha: float = 0.25,
-            gamma: float = 2,
+            alpha: float = cfg.focal_alpha,
+            gamma: float = cfg.focal_gamma,
             reduction: str = "mean",
         ):
             super().__init__()
@@ -402,11 +509,11 @@ if __name__ == "__main__":
     class FocalLossBCE(torch.nn.Module):
         def __init__(
             self,
-            alpha: float = 0.25,
-            gamma: float = 2,
+            alpha: float = cfg.focal_alpha,
+            gamma: float = cfg.focal_gamma,
             reduction: str = "mean",
-            bce_weight: float = 1.0,
-            focal_weight: float = 1.0,
+            bce_weight: float = cfg.bce_weight,
+            focal_weight: float = cfg.focal_weight,
         ):
             super().__init__()
             self.alpha = alpha
@@ -417,7 +524,7 @@ if __name__ == "__main__":
             self.focal_weight = focal_weight
 
         def forward(self, inputs, targets):
-            focall_loss = torchvision.ops.focal_loss.sigmoid_focal_loss(
+            focal_loss = torchvision.ops.focal_loss.sigmoid_focal_loss(
                 inputs=inputs,
                 targets=targets,
                 alpha=self.alpha,
@@ -425,7 +532,7 @@ if __name__ == "__main__":
                 reduction=self.reduction,
             )
             bce_loss = self.bce(inputs, targets)
-            combined_loss = self.bce_weight * bce_loss + self.focal_weight * focall_loss
+            combined_loss = self.bce_weight * bce_loss + self.focal_weight * focal_loss
             return combined_loss
 
     class EfficientViT(L.LightningModule):
@@ -442,8 +549,9 @@ if __name__ == "__main__":
                 [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
             )
 
-            self.loss_function = FocalLoss()
             self.loss_function = FocalLossBCE()
+            # self.loss_function = FocalLoss()
+            # self.loss_function = torch.nn.BCEWithLogitsLoss(reduction=reduction)
             # self.loss_function = nn.CrossEntropyLoss(
             #     label_smoothing=cfg.label_smoothing
             # )
@@ -475,6 +583,71 @@ if __name__ == "__main__":
                 num_labels=cfg.num_classes
             )
 
+        def melspec_mixup(
+            self,
+            x: torch.tensor,
+            y: torch.tensor,
+            secondary_target_weight: float = None,
+        ):
+            mix_lambda = np.random.choice(np.arange(start=0.2, stop=0.55, step=0.05))
+
+            if secondary_target_weight is None:
+                secondary_target_weight = mix_lambda * 1
+
+            batch_size = x.size()[0]
+            batch_index = torch.randperm(batch_size)
+            mixed_x = mix_lambda * x + (1 - mix_lambda) * x[batch_index, :]
+            mixed_y = y + (y[batch_index] * secondary_target_weight)
+            return mixed_x, mixed_y
+
+        # def melspec_supermix(
+        #     self,
+        #     x: torch.tensor,
+        #     y: torch.tensor,
+        #     supermix_prob: float = cfg.supermix_prob,
+        #     min_band_size: int = 50,
+        #     max_band_size: int = 150,
+        #     max_frequency_bands: int = 1,
+        #     max_time_bands: int = 1,
+        #     supermix_target: float = cfg.supermix_target,
+        # ) -> torch.tensor:
+        #     def _get_band(x, min_band_size, max_band_size, band_type, mask):
+        #         if band_type.lower() == "freq":
+        #             axis = 2
+        #         else:
+        #             axis = 1
+        #         band_size = random.randint(min_band_size, max_band_size)
+        #         mask_start = random.randint(0, x.size()[axis] - band_size)
+        #         mask_end = mask_start + band_size
+
+        #         if band_type.lower() == "freq":
+        #             mask[:, mask_start:mask_end] = 1
+        #         if band_type.lower() == "time":
+        #             mask[mask_start:mask_end, :] = 1
+        #         return mask
+
+        #     k = random.random()
+        #     if k > 1 - supermix_prob:
+        #         batch_size = x.size()[0]
+        #         batch_idx = torch.randperm(batch_size).cuda()
+        #         mask = torch.zeros(x.size()[1:3]).cuda()
+        #         num_frequency_bands = random.randint(1, max_frequency_bands)
+        #         for i in range(1, num_frequency_bands):
+        #             mask = _get_band(x, min_band_size, max_band_size, "freq", mask)
+        #         num_time_bands = random.randint(1, max_time_bands)
+        #         for i in range(1, num_time_bands):
+        #             mask = _get_band(x, min_band_size, max_band_size, "time", mask)
+        #         lam = torch.sum(mask) / (x.size()[1] * x.size()[2])
+        #         x = x * (1 - mask) + x[batch_idx] * mask
+
+        #         if supermix_target is not None:
+        #             y = y + (y[batch_idx] * supermix_target)
+        #             y = torch.where(y > 1, torch.ones(y.size()).cuda(), y.cuda()).cuda()
+        #         else:
+        #             y = y * (1 - lam) + y[batch_idx] * (lam)
+
+        #     return x, y
+
         def forward(self, x):
             x = x.unsqueeze(1).expand(-1, 3, -1, -1)  # go from HxW → 3xHxW
             x = x.float() / 255
@@ -485,9 +658,15 @@ if __name__ == "__main__":
 
         def training_step(self, batch, batch_idx):
             x, y, y_binary, y_primary = batch
+
+            if cfg.melspec_mixup:
+                if np.random.random() < cfg.melspec_mixup_prob:
+                    x, y = self.melspec_mixup(x, y, secondary_target_weight=1.0)
+
             y_pred = self(x)
             loss = self.loss_function(y_pred, y)
 
+            y_pred = y_pred.softmax(dim=1)
             train_accuracy_top1 = self.accuracy_top1(y_pred, y_primary)
             train_accuracy_top2 = self.accuracy_top2(y_pred, y_primary)
             train_f1_macro = self.f1_macro(y_pred, y_binary)
@@ -541,6 +720,7 @@ if __name__ == "__main__":
             y_pred = self(x_val)
             val_loss = self.loss_function(y_pred, y_val)
 
+            y_pred = y_pred.softmax(dim=1)
             val_accuracy_top1 = self.accuracy_top1(y_pred, y_primary_val)
             val_accuracy_top2 = self.accuracy_top2(y_pred, y_primary_val)
             val_f1_weighted = self.f1_weighted(y_pred, y_binary_val)
@@ -643,11 +823,11 @@ if __name__ == "__main__":
 
     progress_bar = TQDMProgressBar(process_position=1)
     early_stopping = EarlyStopping(
-        monitor="val_loss",
-        min_delta=0.001,
+        monitor="val_acc_2",
+        min_delta=0.00025,
         patience=cfg.patience,
         verbose=True,
-        mode="min",
+        mode="max",
     )
 
     model = EfficientViT()

@@ -1,6 +1,7 @@
 import gc
 import itertools
 import logging
+import os
 import pickle
 
 import librosa
@@ -11,11 +12,13 @@ import seaborn as sns
 import soundfile
 import torch
 import torchaudio
-from filenames_to_drop import filenames_to_drop
 from IPython.display import Audio
+from joblib import Parallel, delayed
 from matplotlib import pyplot as plt
 from sklearn.model_selection import train_test_split
 from tqdm.notebook import tqdm
+
+from filenames_to_drop import filenames_to_drop
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -34,8 +37,8 @@ sns.set_context("paper", font_scale=0.6)
 
 
 class cfg:
-    root_folder = "input/birdclef-2024"
-    normalize_waveform = True
+    root_folder = "../data"
+    normalize_waveform = False
     sample_rate = 32000
     n_fft = 2048
     hop_length = 512
@@ -44,11 +47,12 @@ class cfg:
     melspec_wres = 312
     freq_min = 20
     freq_max = 16000
-    log_scale_power = 3
+    log_scale_power = 2
     create_frames = True
     frame_duration = None
     max_decibels = 80
     frame_rate = sample_rate / hop_length
+    n_workers = os.cpu_count() - 4
 
 
 def load_data(path: str = cfg.root_folder) -> pd.DataFrame:
@@ -67,11 +71,15 @@ def load_data(path: str = cfg.root_folder) -> pd.DataFrame:
     return model_input_df, submission_df, taxonomy_df
 
 
-def remove_samples(df: pd.DataFrame, filenames_to_drop: list[str]) -> pd.DataFrame:
-    logging.info("Removing hand-selected samples from data")
-    df = df[~df["filename"].isin(filenames_to_drop)]
+def remove_samples(
+    df: pd.DataFrame,
+    remove_duplicates: bool = False,
+    filenames_to_drop: list[str] = filenames_to_drop,
+) -> pd.DataFrame:
+    if remove_duplicates:
+        logging.info("Removing hand-selected samples from data")
+        df = df[~df["filename"].isin(filenames_to_drop)]
     df = df.reset_index(drop=True)
-    df = df.reset_index(drop=False, names="sample_index")
     return df
 
 
@@ -182,7 +190,9 @@ def visualize_train_activity_detection(
     plt.show()
 
 
-def detect_train_activity_windows(melspec: np.ndarray) -> list:
+def detect_train_activity_windows(
+    melspec: np.ndarray, n_peaks: int = 5, always_include_first_5_sec: bool = False
+) -> list:
     energy_per_frame = melspec.sum(axis=0)
     peak_idx = scipy.signal.find_peaks_cwt(
         energy_per_frame,
@@ -199,10 +209,12 @@ def detect_train_activity_windows(melspec: np.ndarray) -> list:
     if peak_idx.size == 0:  # if no peaks are detected take the first 5 seconds
         selected_windows = [[0, cfg.frame_rate * 5]]
     else:
-        top_peaks = np.argsort(-energy_per_frame[peak_idx])[:5]
-        top_peaks_idx = peak_idx[top_peaks]
-
         selected_windows = []
+        if always_include_first_5_sec:
+            selected_windows.append([0, cfg.frame_rate * 5])
+
+        top_peaks = np.argsort(-energy_per_frame[peak_idx])[:n_peaks]
+        top_peaks_idx = peak_idx[top_peaks]
         for peak in top_peaks_idx:
             selected_windows.append(
                 [peak - (cfg.frame_rate * 2.5), peak + (cfg.frame_rate * 2.5)]
@@ -214,11 +226,9 @@ def detect_train_activity_windows(melspec: np.ndarray) -> list:
 def slice_waveforms(filename: str) -> list:
     path = f"{cfg.root_folder}/train_audio/{filename}"
     melspec, waveform = create_log_melspec(path=path)
+    duration = len(waveform)
 
-    if len(waveform) < cfg.sample_rate * 5:
-        train_waves = [waveform]
-    else:
-        selected_windows = detect_train_activity_windows(melspec=melspec)
+    def _select_slices(selected_windows: list) -> list:
         train_waves = []
         for window in selected_windows:
             wave_start = int(window[0] / cfg.frame_rate * cfg.sample_rate)
@@ -227,53 +237,62 @@ def slice_waveforms(filename: str) -> list:
             if wave_start < 0:
                 wave_end = wave_end + abs(wave_start)
                 wave_start = 0
-            if wave_end > len(waveform):
-                wave_end = len(waveform)
+            if wave_end > duration:
+                wave_end = duration
 
             train_waves.append(waveform[wave_start:wave_end])
+
+        return train_waves
+
+    if duration < cfg.sample_rate * 5:
+        train_waves = [waveform]
+    elif duration < cfg.sample_rate * 8:
+        selected_windows = detect_train_activity_windows(melspec=melspec, n_peaks=1)
+        train_waves = _select_slices(selected_windows)
+    elif duration < cfg.sample_rate * 15:
+        selected_windows = detect_train_activity_windows(melspec=melspec, n_peaks=2)
+        train_waves = _select_slices(selected_windows)
+    elif duration < cfg.sample_rate * 25:
+        selected_windows = detect_train_activity_windows(melspec=melspec, n_peaks=4)
+        train_waves = _select_slices(selected_windows)
+    else:
+        selected_windows = detect_train_activity_windows(melspec=melspec, n_peaks=5)
+        train_waves = _select_slices(selected_windows)
 
     return train_waves
 
 
-def generate_train_waves_and_labels(
+def generate_train_waves(
     model_input_df: pd.DataFrame,
-    class_to_label_map: dict,
 ) -> list:
-    train_waves = [
-        slice_waveforms(filename=filename)
+    train_waves = Parallel(n_jobs=cfg.n_workers)(
+        delayed(slice_waveforms)(filename=filename)
         for filename in tqdm(
             model_input_df["filename"],
             desc="Detecting activity and generating train waves",
         )
-    ]
-
-    labels = [
-        class_to_label_map.get(primary_label)
-        for primary_label in tqdm(
-            model_input_df["primary_label"], desc="Generating train wave labels"
-        )
-    ]
-
-    return train_waves, labels
+    )
+    return train_waves
 
 
 def explode_and_flatten_data(
     model_input_df: pd.DataFrame,
     train_waves: list,
-    labels: list,
 ):
     logging.info("Flattening datasets")
     n_waves_per_waveform = [len(wave) for wave in train_waves]
 
     model_input_df["n_frames"] = n_waves_per_waveform
+    model_input_df = model_input_df.reset_index(drop=False, names="sample_index")
+
     model_input_df = model_input_df.loc[
         model_input_df.index.repeat(n_waves_per_waveform)
     ]
+    model_input_df = model_input_df.reset_index(drop=True)
 
-    label_list = np.repeat(labels, n_waves_per_waveform).astype(np.int16)
     train_waves = list(itertools.chain.from_iterable(train_waves))
 
-    return model_input_df, train_waves, label_list
+    return model_input_df, train_waves
 
 
 def add_taxonomies(
@@ -314,196 +333,306 @@ def add_durations(model_input_df: pd.DataFrame) -> pd.DataFrame:
 
 def save_data(path: str = cfg.root_folder) -> None:
     logging.info("Saving processed data to disk")
-    with open(f"{path}/model_input/train_waves_1.pkl", "wb") as f:
-        pickle.dump(train_waves, f)
-
-    with open(f"{path}/model_input/labels_1.pkl", "wb") as f:
-        pickle.dump(labels, f)
-
-    model_input_df.to_csv(f"{path}/model_input/model_input_df_1.csv", index=False)
+    with open(f"{path}/train_waves_1.pkl", "wb") as f:
+        pickle.dump(train_waves_1, f)
+    model_input_df_2.to_csv(f"{path}/model_input_df_2.csv", index=False)
 
 
-model_input_df, submission_df, taxonomy_df = load_data()
-model_input_df = remove_samples(df=model_input_df, filenames_to_drop=filenames_to_drop)
+if __name__ == "__main__":
+    model_input_df, submission_df, taxonomy_df = load_data()
+    # model_input_df = remove_samples(df=model_input_df, filenames_to_drop=filenames_to_drop)
+    model_input_df = add_taxonomies(
+        model_input_df=model_input_df, taxonomy_df=taxonomy_df
+    )
 
-model_input_df, model_input_df_2 = train_test_split(
-    model_input_df, shuffle=False, test_size=0.5, random_state=7
-)  # in case of OOM issues run processing in 2 parts
+    # not enough local RAM, to prevent OOM issues run processing in 3 parts
+    model_input_df, model_input_df_1 = train_test_split(
+        model_input_df, shuffle=False, test_size=0.33, random_state=7
+    )
+    model_input_df_2, model_input_df_3 = train_test_split(
+        model_input_df, shuffle=False, test_size=0.5, random_state=7
+    )
 
-visualize_train_activity_detection(model_input_df=model_input_df)
+    visualize_train_activity_detection(model_input_df=model_input_df)
 
-class_to_label_map, label_to_class_map = create_label_mappings(
-    submission_df=submission_df
-)
-train_waves, labels = generate_train_waves_and_labels(
-    model_input_df=model_input_df, class_to_label_map=class_to_label_map
-)
-model_input_df, train_waves, labels = explode_and_flatten_data(
-    model_input_df=model_input_df, train_waves=train_waves, labels=labels
-)
+    # part 1
+    train_waves_1 = generate_train_waves(model_input_df=model_input_df_1)
+    model_input_df_1, train_waves_1 = explode_and_flatten_data(
+        model_input_df=model_input_df_1, train_waves=train_waves_1
+    )
+    logging.info("Saving processed data to disk")
 
-model_input_df = add_taxonomies(model_input_df=model_input_df, taxonomy_df=taxonomy_df)
-model_input_df = add_durations(model_input_df)
+    window_filename = []
+    for idx, (wave, filename) in enumerate(
+        zip(train_waves_1, model_input_df_1["filename"])
+    ):
+        window_filename.append(
+            "1/" + filename.split(".")[0].replace("/", "_") + f"_{idx}.ogg"
+        )
+    model_input_df_1["window_filename"] = window_filename
+    model_input_df_1.to_csv("../data/model_input_df_1.csv", index=False)
 
-save_data()
+    for idx, (wave, filename) in tqdm(
+        enumerate(zip(train_waves_1, model_input_df_1["filename"])),
+        total=len(model_input_df_1),
+    ):
+        window_filename = filename.split(".")[0] + f"_{idx}.ogg"
+        window_filename = window_filename.replace("/", "_")
+        torchaudio.save(
+            f"{cfg.root_folder}/train_windows_nv_c10/1/{window_filename}",
+            torch.tensor(wave).view(1, -1),
+            sample_rate=cfg.sample_rate,
+            backend="sox",
+            format="ogg",
+            compression=10,
+        )
+
+    del train_waves_1
+    gc.collect()
+
+    # part 2
+    train_waves_2 = generate_train_waves(model_input_df=model_input_df_2)
+    model_input_df_2, train_waves_2 = explode_and_flatten_data(
+        model_input_df=model_input_df_2, train_waves=train_waves_2
+    )
+
+    window_filename = []
+    for idx, (wave, filename) in enumerate(
+        zip(train_waves_2, model_input_df_2["filename"])
+    ):
+        window_filename.append(
+            "2/" + filename.split(".")[0].replace("/", "_") + f"_{idx}.ogg"
+        )
+    model_input_df_2["window_filename"] = window_filename
+    model_input_df_2.to_csv("../data/model_input_df_2.csv", index=False)
+
+    for idx, (wave, filename) in tqdm(
+        enumerate(zip(train_waves_2, model_input_df_2["filename"])),
+        total=len(model_input_df_2),
+    ):
+        window_filename = filename.split(".")[0] + f"_{idx}.ogg"
+        window_filename = window_filename.replace("/", "_")
+        torchaudio.save(
+            f"{cfg.root_folder}/train_windows_nv_c10/2/{window_filename}",
+            torch.tensor(wave).view(1, -1),
+            sample_rate=cfg.sample_rate,
+            backend="sox",
+            format="ogg",
+            compression=10,
+        )
+
+    del train_waves_2
+    gc.collect()
+
+    # part 3
+    train_waves_3 = generate_train_waves(model_input_df=model_input_df_3)
+    model_input_df_3, train_waves_3 = explode_and_flatten_data(
+        model_input_df=model_input_df_3, train_waves=train_waves_3
+    )
+
+    window_filename = []
+    for idx, (wave, filename) in enumerate(
+        zip(train_waves_3, model_input_df_3["filename"])
+    ):
+        window_filename.append(
+            "3/" + filename.split(".")[0].replace("/", "_") + f"_{idx}.ogg"
+        )
+    model_input_df_3["window_filename"] = window_filename
+    model_input_df_3.to_csv("../data/model_input_df_3.csv", index=False)
+
+    for idx, (wave, filename) in tqdm(
+        enumerate(zip(train_waves_3, model_input_df_3["filename"])),
+        total=len(model_input_df_3),
+    ):
+        window_filename = filename.split(".")[0] + f"_{idx}.ogg"
+        window_filename = window_filename.replace("/", "_")
+        torchaudio.save(
+            f"{cfg.root_folder}/train_windows_nv_c10/3/{window_filename}",
+            torch.tensor(wave).view(1, -1),
+            sample_rate=cfg.sample_rate,
+            backend="sox",
+            format="ogg",
+            compression=10,
+        )
+
+    del train_waves_3
+    gc.collect()
+
+    # create full model_input_df
+    model_input_df_1 = pd.read_csv(f"{cfg.root_folder}/model_input_df_1.csv")
+    model_input_df_2 = pd.read_csv(f"{cfg.root_folder}/model_input_df_2.csv")
+    model_input_df_3 = pd.read_csv(f"{cfg.root_folder}/model_input_df_3.csv")
+    model_input_df = pd.concat(
+        [model_input_df_1, model_input_df_2, model_input_df_3], axis=0
+    )
+    model_input_df.to_csv(f"{cfg.root_folder}/model_input_df.csv", index=False)
+
+    model_input_df
+    # model_input_df = add_durations(model_input_df)
+
+    # ""
+
+    # save_data()
+
+    model_input_df["primary_label"].value_counts()
 
 # #####################################################################################
 
 
-# due to of OOM issues combine all 2 data parts back into 1
-def load_and_combine_processed_data():
-    logger.info(f"Loading prepared data parts from {cfg.root_folder}")
-    with open(f"{cfg.root_folder}/model_input/train_waves_1.pkl", "rb") as file:
-        train_waves_1 = pickle.load(file)
-    with open(f"{cfg.root_folder}/model_input/train_waves_2.pkl", "rb") as file:
-        train_waves_2 = pickle.load(file)
+# # due to of OOM issues combine all 2 data parts back into 1
+# def load_and_combine_processed_data():
+#     logger.info(f"Loading prepared data parts from {cfg.root_folder}")
+#     with open(f"{cfg.root_folder}/model_input/train_waves_1.pkl", "rb") as file:
+#         train_waves_1 = pickle.load(file)
+#     with open(f"{cfg.root_folder}/model_input/train_waves_2.pkl", "rb") as file:
+#         train_waves_2 = pickle.load(file)
 
-    with open(f"{cfg.root_folder}/model_input/labels_1.pkl", "rb") as file:
-        labels_1 = pickle.load(file)
-    with open(f"{cfg.root_folder}/model_input/labels_2.pkl", "rb") as file:
-        labels_2 = pickle.load(file)
+#     with open(f"{cfg.root_folder}/model_input/labels_1.pkl", "rb") as file:
+#         labels_1 = pickle.load(file)
+#     with open(f"{cfg.root_folder}/model_input/labels_2.pkl", "rb") as file:
+#         labels_2 = pickle.load(file)
 
-    model_input_df_1 = pd.read_csv(
-        f"{cfg.root_folder}/model_input/model_input_df_1.csv"
-    )
-    model_input_df_2 = pd.read_csv(
-        f"{cfg.root_folder}/model_input/model_input_df_2.csv"
-    )
-    logger.info(f"Wave size 1: {len(train_waves_1)}, size 2: {len(train_waves_2)}")
-    logger.info(f"Label size 1: {len(labels_1)}, size 2: {len(labels_2)}")
-    logger.info(f"Df size 1: {len(model_input_df_1)}, size 2: {len(model_input_df_2)}")
+#     model_input_df_1 = pd.read_csv(
+#         f"{cfg.root_folder}/model_input/model_input_df_1.csv"
+#     )
+#     model_input_df_2 = pd.read_csv(
+#         f"{cfg.root_folder}/model_input/model_input_df_2.csv"
+#     )
+#     logger.info(f"Wave size 1: {len(train_waves_1)}, size 2: {len(train_waves_2)}")
+#     logger.info(f"Label size 1: {len(labels_1)}, size 2: {len(labels_2)}")
+#     logger.info(f"Df size 1: {len(model_input_df_1)}, size 2: {len(model_input_df_2)}")
 
-    logger.info("Combining data parts")
-    train_waves = train_waves_1 + train_waves_2
-    del train_waves_1, train_waves_2
-    gc.collect()
+#     logger.info("Combining data parts")
+#     train_waves = train_waves_1 + train_waves_2
+#     del train_waves_1, train_waves_2
+#     gc.collect()
 
-    labels = np.append(labels_1, labels_2)
-    model_input_df = pd.concat([model_input_df_1, model_input_df_2], axis=0)
-    model_input_df = model_input_df.reset_index(drop=True)
-    del model_input_df_1, model_input_df_2
-    del labels_1, labels_2
-    gc.collect()
+#     labels = np.append(labels_1, labels_2)
+#     model_input_df = pd.concat([model_input_df_1, model_input_df_2], axis=0)
+#     model_input_df = model_input_df.reset_index(drop=True)
+#     del model_input_df_1, model_input_df_2
+#     del labels_1, labels_2
+#     gc.collect()
 
-    return train_waves, labels, model_input_df
-
-
-def save_combined_data(
-    path: str,
-    train_waves: list,
-    labels: list,
-    model_input_df: pd.DataFrame,
-) -> None:
-    logging.info("Saving combined processed data to disk")
-    with open(f"{path}/model_input/train_waves.pkl", "wb") as f:
-        pickle.dump(train_waves, f)
-
-    with open(f"{path}/model_input/labels.pkl", "wb") as f:
-        pickle.dump(labels, f)
-
-    model_input_df.to_csv(f"{path}/model_input/model_input_df.csv", index=False)
+#     return train_waves, labels, model_input_df
 
 
-train_waves, labels, model_input_df = load_and_combine_processed_data()
-# save_combined_data(
-#     path=cfg.root_folder,
-#     train_waves=train_waves,
-#     labels=labels,
-#     model_input_df=model_input_df,
-# )
+# def save_combined_data(
+#     path: str,
+#     train_waves: list,
+#     labels: list,
+#     model_input_df: pd.DataFrame,
+# ) -> None:
+#     logging.info("Saving combined processed data to disk")
+#     with open(f"{path}/model_input/train_waves.pkl", "wb") as f:
+#         pickle.dump(train_waves, f)
+
+#     with open(f"{path}/model_input/labels.pkl", "wb") as f:
+#         pickle.dump(labels, f)
+
+#     model_input_df.to_csv(f"{path}/model_input/model_input_df.csv", index=False)
 
 
-######################
-
-for idx, (wave, filename) in tqdm(
-    enumerate(zip(train_waves_2, model_input_df_2["filename"])),
-    total=len(model_input_df_2),
-):
-    window_filename = filename.split(".")[0] + f"_{idx}.ogg"
-    window_filename = window_filename.replace("/", "_")
-    torchaudio.save(
-        f"input/birdclef-2024/model_input/train_audio_window_n5_s5_c9/2/{window_filename}",
-        torch.tensor(wave).view(1, -1),
-        sample_rate=cfg.sample_rate,
-        backend="sox",
-        format="ogg",
-        compression=9,
-    )
+# train_waves, labels, model_input_df = load_and_combine_processed_data()
+# # save_combined_data(
+# #     path=cfg.root_folder,
+# #     train_waves=train_waves,
+# #     labels=labels,
+# #     model_input_df=model_input_df,
+# # )
 
 
-window_filename = []
-for idx, (wave, filename) in enumerate(
-    zip(train_waves_1, model_input_df_1["filename"])
-):
-    window_filename.append(
-        "1/" + filename.split(".")[0].replace("/", "_") + f"_{idx}.ogg"
-    )
-model_input_df_1["window_filename"] = window_filename
+# ######################
 
-window_filename = []
-for idx, (wave, filename) in enumerate(
-    zip(train_waves_2, model_input_df_2["filename"])
-):
-    window_filename.append(
-        "2/" + filename.split(".")[0].replace("/", "_") + f"_{idx}.ogg"
-    )
-model_input_df_2["window_filename"] = window_filename
-
-model_input_df = pd.concat([model_input_df_1, model_input_df_2], axis=0)
-
-model_input_df = model_input_df[model_input_df["duration"] >= 2]
-model_input_df = model_input_df.reset_index(drop=True)
-model_input_df.to_csv("../data/model_input_df.csv", index=False)
-
-# soundfile.write(
-#     "test.flac",
-#     train_waves[35001],
-#     samplerate=cfg.sample_rate,
-#     format="flac",
-# )
-waveform, _ = librosa.load("test_ogg_c9.ogg", sr=cfg.sample_rate)
-
-sns.lineplot(train_waves[35002], linewidth=0.5)
-sns.lineplot(waveform, linewidth=0.5)
-sns.lineplot(train_waves[35002], linewidth=0.5)
-
-waveform = librosa.util.normalize(waveform)
-
-# import sys
-# sys.getsizeof(waveform) / 1024
-
-# # def pcen_bird(melspec):
-# #     """
-# #     parameters are taken from [1]:
-# #         - [1] Lostanlen, et. al. Per-Channel Energy Normalization: Why and How. IEEE Signal Processing Letters, 26(1), 39-43.
-# #     """
-# #     pcen = librosa.pcen(
-# #         melspec * (2**31),
-# #         time_constant=0.06,
-# #         eps=1e-6,
-# #         gain=0.8,
-# #         power=0.25,
-# #         bias=10,
-# #         sr=cfg.sample_rate,
-# #         hop_length=cfg.hop_length,
-# #     )
-# #     return pcen
+# for idx, (wave, filename) in tqdm(
+#     enumerate(zip(train_waves_2, model_input_df_2["filename"])),
+#     total=len(model_input_df_2),
+# ):
+#     window_filename = filename.split(".")[0] + f"_{idx}.ogg"
+#     window_filename = window_filename.replace("/", "_")
+#     torchaudio.save(
+#         f"{cfg.root_folder}/train_windows_nv_s5_c10/2/{window_filename}",
+#         torch.tensor(wave).view(1, -1),
+#         sample_rate=cfg.sample_rate,
+#         backend="sox",
+#         format="ogg",
+#         compression=10,
+#     )
 
 
-# # idx = 23388
-# # idx = 22848
-# # idx = 9599
-# # idx = 11818
-# # idx = 13755
-# # idx = 4612
-# # idx = 605
-# # idx = 11494
+# window_filename = []
+# for idx, (wave, filename) in enumerate(
+#     zip(train_waves_1, model_input_df_1["filename"])
+# ):
+#     window_filename.append(
+#         "1/" + filename.split(".")[0].replace("/", "_") + f"_{idx}.ogg"
+#     )
+# model_input_df_1["window_filename"] = window_filename
+
+# window_filename = []
+# for idx, (wave, filename) in enumerate(
+#     zip(train_waves_2, model_input_df_2["filename"])
+# ):
+#     window_filename.append(
+#         "2/" + filename.split(".")[0].replace("/", "_") + f"_{idx}.ogg"
+#     )
+# model_input_df_2["window_filename"] = window_filename
+
+# model_input_df = pd.concat([model_input_df_1, model_input_df_2], axis=0)
+
+# model_input_df = model_input_df[model_input_df["duration"] >= 2]
+# model_input_df = model_input_df.reset_index(drop=True)
+# model_input_df.to_csv("../data/model_input_df.csv", index=False)
+
+# # soundfile.write(
+# #     "test.flac",
+# #     train_waves[35001],
+# #     samplerate=cfg.sample_rate,
+# #     format="flac",
+# # )
+# waveform, _ = librosa.load("test_ogg_c9.ogg", sr=cfg.sample_rate)
+
+# sns.lineplot(train_waves[35002], linewidth=0.5)
+# sns.lineplot(waveform, linewidth=0.5)
+# sns.lineplot(train_waves[35002], linewidth=0.5)
+
+# waveform = librosa.util.normalize(waveform)
+
+# # import sys
+# # sys.getsizeof(waveform) / 1024
+
+# # # def pcen_bird(melspec):
+# # #     """
+# # #     parameters are taken from [1]:
+# # #         - [1] Lostanlen, et. al. Per-Channel Energy Normalization: Why and How. IEEE Signal Processing Letters, 26(1), 39-43.
+# # #     """
+# # #     pcen = librosa.pcen(
+# # #         melspec * (2**31),
+# # #         time_constant=0.06,
+# # #         eps=1e-6,
+# # #         gain=0.8,
+# # #         power=0.25,
+# # #         bias=10,
+# # #         sr=cfg.sample_rate,
+# # #         hop_length=cfg.hop_length,
+# # #     )
+# # #     return pcen
 
 
-# # visualize_train_activity_detection(model_input_df=model_input_df, idx=23388)
+# # # idx = 23388
+# # # idx = 22848
+# # # idx = 9599
+# # # idx = 11818
+# # # idx = 13755
+# # # idx = 4612
+# # # idx = 605
+# # # idx = 11494
 
 
-# # select window slices on waveform
-# # apply augmentations
-# # turn into melspec / log melspec -> use torch audio
-# # apply PCEN yes/no
+# # # visualize_train_activity_detection(model_input_df=model_input_df, idx=23388)
+
+
+# # # select window slices on waveform
+# # # apply augmentations
+# # # turn into melspec / log melspec -> use torch audio
+# # # apply PCEN yes/no
