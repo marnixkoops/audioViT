@@ -64,52 +64,6 @@ def load_metadata(path: str = cfg.root_folder) -> pd.DataFrame:
             "primary_label": "category",
         },
     )
-
-    model_input_additional_df = pd.read_csv(
-        f"{cfg.root_folder}/train_metadata_additional.csv",
-    )
-
-    missing_files = [
-        "XC775312",
-        "XC881009",
-        "XC891005",
-        "XC891004",
-        "XC798809",
-        "XC798808",
-        "XC798807",
-        "XC798806",
-        "XC798805",
-        "XC835367",
-        "XC762524",
-    ]
-    model_input_additional_df = model_input_additional_df[
-        ~model_input_additional_df["file"].isin(missing_files)
-    ]
-
-    model_input_additional_df["filename"] = (
-        model_input_additional_df["primary_label"]
-        + "/"
-        + model_input_additional_df["file"]
-        + ".wav"
-    )
-    model_input_additional_df = model_input_additional_df[
-        ["primary_label", "also", "type", "lat", "lng", "rec", "lic", "url", "filename"]
-    ]
-    model_input_additional_df.columns = [
-        "primary_label",
-        "secondary_labels",
-        "type",
-        "latitude",
-        "longitude",
-        "author",
-        "license",
-        "url",
-        "filename",
-    ]
-
-    model_input_df = pd.concat([model_input_df, model_input_additional_df], axis=0)
-    model_input_df = model_input_df.reset_index(drop=True)
-
     submission_df = pd.read_csv(f"{cfg.root_folder}/sample_submission.csv")
     taxonomy_df = pd.read_csv(f"{cfg.root_folder}/eBird_Taxonomy_v2021.csv")
 
