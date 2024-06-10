@@ -47,12 +47,12 @@ warnings.simplefilter("ignore")
 
 
 class cfg:
-    experiment_name = "base_mixup"
+    experiment_name = "efnetv2s"
     data_path = "../data"
 
-    debug_run = True  # run on a small sample
+    debug_run = False  # run on a small sample
     experiment_run = False  # run on a stratified data sample
-    production_run = False  # run on all data
+    production_run = True  # run on all data
 
     normalize_waveform = False  # TODO test with and without
     sample_rate = 32000
@@ -74,36 +74,36 @@ class cfg:
     # vit_b2 = "efficientvit_b2.r224_in1k"
     # efnet_b0 = "tf_efficientnet_b0.in1k"
     # efnetv2_b0 = "tf_efficientnetv2_b0.in1k"
-    # efnetv2s = "tf_efficientnetv2_s.in21k_ft_in1k"  # TODO
+    efnetv2s = "tf_efficientnetv2_s.in21k_ft_in1k"  # TODO
     # efnet_b0_jft = "tf_efficientnet_b0.ns_jft_in1k" # TODO
-    efnetv2_b1 = "tf_efficientnetv2_b1.in1k"
+    # efnetv2_b1 = "tf_efficientnetv2_b1.in1k"
     # vit_m0 = "efficientvit_m0.r224_in1k"
     # vit_m1 = "efficientvit_m1.r224_in1k"
-    backbone = efnetv2_b1
+    backbone = efnetv2s
 
     num_classes = 182
     mixup = True
     mixup_alpha = 3
     augment_melspec = True
-    add_secondary_labels = True
+    add_secondary_labels = False
     add_secondary_label_weight = 0.33
 
     label_smoothing = 0.1
-    weighted_sampling = True
+    weighted_sampling = False
     sample_weight_factor = 0.5
 
     accelerator = "gpu"
-    precision = "16-mixed"
+    precision = "bf16-mixed"
     n_workers = os.cpu_count() - 2
 
     n_epochs = 50
     batch_size = 128
-    val_ratio = 0.25
+    val_ratio = 0.20
     patience = 10
 
     lr = 1e-3
     lr_min = 1e-6
-    weight_decay = 1e-4
+    weight_decay = 1e-3
 
     loss = "FocalBCE"
     optimizer = "AdamW"
@@ -425,12 +425,12 @@ class EfficientNetV2(L.LightningModule):
         )
 
         # self.loss_function = FocalCosineLoss()
-        # self.loss_function = FocalLossBCE()
+        self.loss_function = FocalLossBCE()
         # self.loss_function = FocalLoss()
         # self.loss_function = torch.nn.BCEWithLogitsLoss(reduction="mean")
-        self.loss_function = torch.nn.CrossEntropyLoss(
-            label_smoothing=cfg.label_smoothing
-        )
+        # self.loss_function = torch.nn.CrossEntropyLoss(
+        #     label_smoothing=cfg.label_smoothing
+        # )
 
         self.accuracy = torchmetrics.Accuracy(
             task="multiclass", num_classes=cfg.num_classes, top_k=1
@@ -492,28 +492,6 @@ class EfficientNetV2(L.LightningModule):
         target = target * lam + mix_target * (1 - lam)
 
         return melspec, target
-
-    # def time_mixup(self, melspec, target):
-    #     indices = torch.randperm(melspec.size(0))
-    #     mix_melspec = melspec[indices]
-    #     mix_target = target[indices]
-
-    #     melspec = torch.cat([melspec[:, :, :156, :], mix_melspec[:, :, 157:, :]], dim=2)
-    #     target = target + mix_target
-    #     target = torch.clamp(target, max=1)
-
-    #     return melspec, target
-
-    # def freq_mixup(self, melspec, target):
-    #     indices = torch.randperm(melspec.size(0))
-    #     mix_melspec = melspec[indices]
-    #     mix_target = target[indices]
-
-    #     melspec = torch.cat([melspec[:, :64, :, :], mix_melspec[:, 64:, :, :]], dim=1)
-    #     target = target + mix_target
-    #     target = torch.clamp(target, max=1)
-
-    #     return melspec, target
 
     def forward(self, x):
         x = x.permute(0, 3, 1, 2)
@@ -754,12 +732,6 @@ class EfficientNetV2(L.LightningModule):
         logger.info(f"Epoch {self.trainer.current_epoch}: {metrics}")
 
     def configure_optimizers(self):
-        # optimizer = Adan(
-        #     model.parameters(),
-        #     lr=cfg.lr,
-        #     betas=(0.02, 0.08, 0.01),
-        #     weight_decay=cfg.weight_decay,
-        # )
         optimizer = torch.optim.AdamW(
             params=self.parameters(),
             lr=cfg.lr,
@@ -796,12 +768,10 @@ if __name__ == "__main__":
 
     waveforms = read_waveforms_parallel(model_input_df=model_input_df)
 
-    # waveforms = pad_or_crop_waveforms(waveforms=waveforms)
-
     if cfg.augment_melspec:
         train_augmentation = albumentations.Compose(
             [
-                # albumentations.AdvancedBlur(p=0.20),
+                albumentations.AdvancedBlur(p=0.20),
                 albumentations.GaussNoise(p=0.20),
                 albumentations.ImageCompression(
                     quality_lower=80, quality_upper=100, p=0.20
@@ -821,21 +791,11 @@ if __name__ == "__main__":
                     mask_x_length=(3, 20),
                     mask_y_length=(3, 20),
                 ),
-                # albumentations.RandomGridShuffle(grid=(2, 2), p=0.20),
-                # albumentations.Downscale(
-                #     scale_min=0.2, scale_max=0.9, interpolation=4, p=0.10
-                # ),
-                # albumentations.Normalize(p=1),
             ]
         )
     else:
         train_augmentation = None
 
-    # grouped split on sample index to keep different windows from the same sample
-    # together if splitting randomly this can be considered as a form of leakage
-    # validating on a windowed waveform while windows of the same waveform were used for
-    # training is easier than classifying a waveform from a different sample, which is
-    # the case in practice
     logger.info(f"Splitting {len(waveforms)} waveforms into train/val: {cfg.val_ratio}")
     n_splits = int(round(1 / cfg.val_ratio))
     kfold = StratifiedKFold(n_splits=n_splits, shuffle=True)
