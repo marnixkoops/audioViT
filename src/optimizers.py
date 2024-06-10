@@ -273,10 +273,10 @@ class NvidiaNovoGrad(torch.optim.Optimizer):
             amsgrad=amsgrad,
         )
 
-        super(NvNovoGrad, self).__init__(params, defaults)
+        super(NvidiaNovoGrad, self).__init__(params, defaults)
 
     def __setstate__(self, state):
-        super(NvNovoGrad, self).__setstate__(state)
+        super(NvidiaNovoGrad, self).__setstate__(state)
         for group in self.param_groups:
             group.setdefault("amsgrad", False)
 
@@ -308,12 +308,10 @@ class NvidiaNovoGrad(torch.optim.Optimizer):
                     # Exponential moving average of gradient values
                     state["exp_avg"] = torch.zeros_like(p.data)
                     # Exponential moving average of squared gradient values
-                    state["exp_avg_sq"] = torch.zeros([]).to(state["exp_avg"].device)
+                    state["exp_avg_sq"] = torch.zeros([])
                     if amsgrad:
                         # Maintains max of all exp. moving avg. of sq. grad. values
-                        state["max_exp_avg_sq"] = torch.zeros([]).to(
-                            state["exp_avg"].device
-                        )
+                        state["max_exp_avg_sq"] = torch.zeros([])
 
                 exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
                 if amsgrad:

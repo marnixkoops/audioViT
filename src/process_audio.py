@@ -49,13 +49,14 @@ class cfg:
     freq_max = 16000
     log_scale_power = 2
     create_frames = True
-    frame_duration = None
+    frame_duration = 6
     max_decibels = 80
     frame_rate = sample_rate / hop_length
+    max_load_duration = 5 * 60
     n_workers = os.cpu_count() - 4
 
 
-def load_data(path: str = cfg.root_folder) -> pd.DataFrame:
+def load_metadata(path: str = cfg.root_folder) -> pd.DataFrame:
     logging.info("Loading data")
     model_input_df = pd.read_csv(
         f"{cfg.root_folder}/train_metadata.csv",
@@ -65,6 +66,51 @@ def load_data(path: str = cfg.root_folder) -> pd.DataFrame:
         },
     )
 
+    model_input_additional_df = pd.read_csv(
+        f"{cfg.root_folder}/train_metadata_additional.csv",
+    )
+
+    missing_files = [
+        "XC775312",
+        "XC881009",
+        "XC891005",
+        "XC891004",
+        "XC798809",
+        "XC798808",
+        "XC798807",
+        "XC798806",
+        "XC798805",
+        "XC835367",
+        "XC762524",
+    ]
+    model_input_additional_df = model_input_additional_df[
+        ~model_input_additional_df["file"].isin(missing_files)
+    ]
+
+    model_input_additional_df["filename"] = (
+        model_input_additional_df["primary_label"]
+        + "/"
+        + model_input_additional_df["file"]
+        + ".wav"
+    )
+    model_input_additional_df = model_input_additional_df[
+        ["primary_label", "also", "type", "lat", "lng", "rec", "lic", "url", "filename"]
+    ]
+    model_input_additional_df.columns = [
+        "primary_label",
+        "secondary_labels",
+        "type",
+        "latitude",
+        "longitude",
+        "author",
+        "license",
+        "url",
+        "filename",
+    ]
+
+    model_input_df = pd.concat([model_input_df, model_input_additional_df], axis=0)
+    model_input_df = model_input_df.reset_index(drop=True)
+
     submission_df = pd.read_csv(f"{cfg.root_folder}/sample_submission.csv")
     taxonomy_df = pd.read_csv(f"{cfg.root_folder}/eBird_Taxonomy_v2021.csv")
 
@@ -73,8 +119,8 @@ def load_data(path: str = cfg.root_folder) -> pd.DataFrame:
 
 def remove_samples(
     df: pd.DataFrame,
+    filenames_to_drop: list[str],
     remove_duplicates: bool = False,
-    filenames_to_drop: list[str] = filenames_to_drop,
 ) -> pd.DataFrame:
     if remove_duplicates:
         logging.info("Removing hand-selected samples from data")
@@ -98,7 +144,7 @@ def create_log_melspec(
     path: str,
     normalize: bool = cfg.normalize_waveform,
 ) -> np.ndarray:
-    waveform, _ = librosa.load(path, sr=cfg.sample_rate, duration=cfg.frame_duration)
+    waveform, _ = librosa.load(path, sr=cfg.sample_rate, duration=cfg.max_load_duration)
 
     if normalize:
         waveform = librosa.util.normalize(waveform)
@@ -144,14 +190,12 @@ def visualize_train_activity_detection(
         window_size=None,
     )
 
-    top_peaks = np.argsort(-energy[peaks])[:5]
+    top_peaks = np.argsort(-energy[peaks])[:3]
     top_peaks_index = peaks[top_peaks]
 
     selected_windows = []
     for i in top_peaks_index:
-        selected_windows.append(
-            [i - (cfg.frame_rate * 2.5), i + (cfg.frame_rate * 2.5)]
-        )
+        selected_windows.append([i - (cfg.frame_rate * 3), i + (cfg.frame_rate * 3)])
 
     fig, ax = plt.subplots(2, 1, sharex=True)
     sns.heatmap(melspec, ax=ax[0], cbar=False)
@@ -191,7 +235,7 @@ def visualize_train_activity_detection(
 
 
 def detect_train_activity_windows(
-    melspec: np.ndarray, n_peaks: int = 5, always_include_first_5_sec: bool = False
+    melspec: np.ndarray, n_peaks: int = 5, always_include_first_secs: bool = False
 ) -> list:
     energy_per_frame = melspec.sum(axis=0)
     peak_idx = scipy.signal.find_peaks_cwt(
@@ -206,18 +250,18 @@ def detect_train_activity_windows(
         window_size=None,
     )
 
-    if peak_idx.size == 0:  # if no peaks are detected take the first 5 seconds
-        selected_windows = [[0, cfg.frame_rate * 5]]
+    if peak_idx.size == 0:  # if no peaks are detected take the first 6 seconds
+        selected_windows = [[0, cfg.frame_rate * 6]]
     else:
         selected_windows = []
-        if always_include_first_5_sec:
-            selected_windows.append([0, cfg.frame_rate * 5])
+        if always_include_first_secs:
+            selected_windows.append([0, cfg.frame_rate * 6])
 
         top_peaks = np.argsort(-energy_per_frame[peak_idx])[:n_peaks]
         top_peaks_idx = peak_idx[top_peaks]
         for peak in top_peaks_idx:
             selected_windows.append(
-                [peak - (cfg.frame_rate * 2.5), peak + (cfg.frame_rate * 2.5)]
+                [peak - (cfg.frame_rate * 3), peak + (cfg.frame_rate * 3)]
             )
 
     return selected_windows
@@ -244,19 +288,19 @@ def slice_waveforms(filename: str) -> list:
 
         return train_waves
 
-    if duration < cfg.sample_rate * 5:
+    if duration / cfg.sample_rate < 6:
         train_waves = [waveform]
-    elif duration < cfg.sample_rate * 8:
-        selected_windows = detect_train_activity_windows(melspec=melspec, n_peaks=1)
-        train_waves = _select_slices(selected_windows)
-    elif duration < cfg.sample_rate * 15:
+    elif duration / cfg.sample_rate < 12:
         selected_windows = detect_train_activity_windows(melspec=melspec, n_peaks=2)
         train_waves = _select_slices(selected_windows)
-    elif duration < cfg.sample_rate * 25:
+    elif duration / cfg.sample_rate > 90:
         selected_windows = detect_train_activity_windows(melspec=melspec, n_peaks=4)
         train_waves = _select_slices(selected_windows)
-    else:
+    elif duration / cfg.sample_rate > 180:
         selected_windows = detect_train_activity_windows(melspec=melspec, n_peaks=5)
+        train_waves = _select_slices(selected_windows)
+    else:
+        selected_windows = detect_train_activity_windows(melspec=melspec, n_peaks=3)
         train_waves = _select_slices(selected_windows)
 
     return train_waves
@@ -295,6 +339,32 @@ def explode_and_flatten_data(
     return model_input_df, train_waves
 
 
+def pad_or_crop_waveforms(waveforms: list, pad_method: str = "repeat") -> list:
+    logging.info("Padding or cropping waveforms to desired duration")
+    desired_length = cfg.sample_rate * cfg.frame_duration
+
+    def _pad_or_crop(waveform: np.ndarray) -> np.ndarray:
+        length = len(waveform)
+
+        while length < desired_length:  # repeat if waveform too small
+            repeat_length = desired_length - length
+            padding_array = waveform[:repeat_length]
+            if pad_method != "repeat":
+                padding_array = np.zeros(shape=waveform[:repeat_length].shape)
+            waveform = np.concatenate([waveform, padding_array])
+            length = len(waveform)
+
+        if length > desired_length:  # crop if waveform is too big
+            offset = np.random.randint(0, length - desired_length)
+            waveform = waveform[offset : offset + desired_length]
+
+        return waveform
+
+    waveforms = [_pad_or_crop(wave) for wave in tqdm(waveforms, desc="Padding waves")]
+
+    return waveforms
+
+
 def add_taxonomies(
     model_input_df: pd.DataFrame, taxonomy_df: pd.DataFrame
 ) -> pd.DataFrame:
@@ -315,17 +385,13 @@ def add_taxonomies(
 
 def add_durations(model_input_df: pd.DataFrame) -> pd.DataFrame:
     def _get_duration(filename: str) -> float:
-        sample = soundfile.SoundFile(
-            f"{cfg.data_path}/train_windows_n5_s5_c9/{filename}"
-        )
+        sample = soundfile.SoundFile(f"{cfg.root_folder}/train_audio/{filename}")
         duration = len(sample) / sample.samplerate
         return duration
 
     model_input_df["duration"] = [
         _get_duration(filename)
-        for filename in tqdm(
-            model_input_df["window_filename"], desc="Calculating durations"
-        )
+        for filename in tqdm(model_input_df["filename"], desc="Calculating durations")
     ]
 
     return model_input_df
@@ -339,8 +405,10 @@ def save_data(path: str = cfg.root_folder) -> None:
 
 
 if __name__ == "__main__":
-    model_input_df, submission_df, taxonomy_df = load_data()
-    # model_input_df = remove_samples(df=model_input_df, filenames_to_drop=filenames_to_drop)
+    model_input_df, submission_df, taxonomy_df = load_metadata()
+    model_input_df = remove_samples(
+        df=model_input_df, filenames_to_drop=filenames_to_drop
+    )
     model_input_df = add_taxonomies(
         model_input_df=model_input_df, taxonomy_df=taxonomy_df
     )
@@ -350,7 +418,7 @@ if __name__ == "__main__":
         model_input_df, shuffle=False, test_size=0.33, random_state=7
     )
     model_input_df_2, model_input_df_3 = train_test_split(
-        model_input_df, shuffle=False, test_size=0.5, random_state=7
+        model_input_df, shuffle=False, test_size=0.33, random_state=7
     )
 
     visualize_train_activity_detection(model_input_df=model_input_df)
@@ -379,7 +447,7 @@ if __name__ == "__main__":
         window_filename = filename.split(".")[0] + f"_{idx}.ogg"
         window_filename = window_filename.replace("/", "_")
         torchaudio.save(
-            f"{cfg.root_folder}/train_windows_nv_c10/1/{window_filename}",
+            f"{cfg.root_folder}/train_windows_n3/1/{window_filename}",
             torch.tensor(wave).view(1, -1),
             sample_rate=cfg.sample_rate,
             backend="sox",
@@ -413,7 +481,7 @@ if __name__ == "__main__":
         window_filename = filename.split(".")[0] + f"_{idx}.ogg"
         window_filename = window_filename.replace("/", "_")
         torchaudio.save(
-            f"{cfg.root_folder}/train_windows_nv_c10/2/{window_filename}",
+            f"{cfg.root_folder}/train_windows_n3/2/{window_filename}",
             torch.tensor(wave).view(1, -1),
             sample_rate=cfg.sample_rate,
             backend="sox",
@@ -447,7 +515,7 @@ if __name__ == "__main__":
         window_filename = filename.split(".")[0] + f"_{idx}.ogg"
         window_filename = window_filename.replace("/", "_")
         torchaudio.save(
-            f"{cfg.root_folder}/train_windows_nv_c10/3/{window_filename}",
+            f"{cfg.root_folder}/train_windows_n3/3/{window_filename}",
             torch.tensor(wave).view(1, -1),
             sample_rate=cfg.sample_rate,
             backend="sox",
@@ -467,14 +535,8 @@ if __name__ == "__main__":
     )
     model_input_df.to_csv(f"{cfg.root_folder}/model_input_df.csv", index=False)
 
-    model_input_df
-    # model_input_df = add_durations(model_input_df)
 
-    # ""
-
-    # save_data()
-
-    model_input_df["primary_label"].value_counts()
+model_input_df[model_input_df["secondary_labels"] == "[]"]
 
 # #####################################################################################
 
