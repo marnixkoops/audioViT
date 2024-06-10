@@ -6,4 +6,4 @@ logs/*
 */lightning_logs/*
 *old.py
 *backup.py
-dev/*
+dev
